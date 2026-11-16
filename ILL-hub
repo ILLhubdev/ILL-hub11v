@@ -1,0 +1,712 @@
+-- ILL HUB v11 - draggable + configurable, black/green theme
+-- Tabs: Autofarm | Auto Train | Config
+-- Farm loop: teleport -> Throw_Start -> wait -> Throw_Resolve -> Throw_Complete -> Plot_EquipBest (every N cycles)
+-- Auto train: ON -> tween to train pos, OFF -> cancel tween + Training_Stop
+-- Auto 2x bonus: hooks Training_Bonus (server event) and answers with Training_TapBonus(id)
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local VirtualUser = game:GetService("VirtualUser")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- ===== CONFIG =====
+local Config = {
+    Enabled = false,
+    Training = false,
+    AntiAfk = true,
+    Teleport = true,
+    TeleportEveryCycle = true,
+    EquipBest = true,
+    EquipEvery = 1,                            -- equip best pets every N cycles
+    Position = Vector3.new(-3, 6, -39),        -- farm position
+    TrainPosition = Vector3.new(-59, 6, -8),   -- training position (tweened to)
+    TweenSpeed = 60,                           -- studs per second for the train tween
+    ThrowDelay = 0.5,                          -- wait between Throw_Start and Throw_Resolve
+    CycleDelay = 0.1,                          -- wait after each cycle
+    ResolveValue = 0.99144317146610506,
+    AutoBonus = true,                          -- auto tap the x2 bonus while training
+    BonusDelay = 0.15,                         -- wait before tapping the bonus (seconds)
+}
+
+-- ===== THEME =====
+local THEME = {
+    bg = Color3.fromRGB(10, 10, 10),
+    header = Color3.fromRGB(5, 5, 5),
+    off = Color3.fromRGB(26, 26, 26),
+    box = Color3.fromRGB(24, 24, 24),
+    green = Color3.fromRGB(0, 230, 90),
+    greenDark = Color3.fromRGB(0, 100, 45),
+    text = Color3.fromRGB(200, 255, 220),
+    black = Color3.new(0, 0, 0),
+}
+
+-- ===== Parent / cleanup old copies =====
+local function getParent()
+    local ok, ui = pcall(function() return gethui and gethui() end)
+    if ok and ui then return ui end
+    local ok2, core = pcall(function() return game:GetService("CoreGui") end)
+    if ok2 and core then return core end
+    return playerGui
+end
+
+local parent = getParent()
+for _, name in ipairs({ "ILLHubGUI", "ThrowAutofarmGUI" }) do
+    local old = parent:FindFirstChild(name)
+    if old then old:Destroy() end -- old loops stop themselves when their GUI is gone
+end
+
+-- ===== GUI =====
+local gui = Instance.new("ScreenGui")
+gui.Name = "ILLHubGUI"
+gui.ResetOnSpawn = false
+
+local FULL_SIZE = UDim2.fromOffset(260, 400)
+
+local main = Instance.new("Frame")
+main.Size = FULL_SIZE
+main.Position = UDim2.fromOffset(60, 80)
+main.BackgroundColor3 = THEME.bg
+main.BorderSizePixel = 0
+main.Active = true
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+local mainStroke = Instance.new("UIStroke", main)
+mainStroke.Color = THEME.green
+mainStroke.Thickness = 1.5
+
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 30)
+header.BackgroundColor3 = THEME.header
+header.BorderSizePixel = 0
+header.Parent = main
+Instance.new("UICorner", header).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -70, 1, 0)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "ILL HUB"
+title.TextColor3 = THEME.green
+title.Font = Enum.Font.GothamBlack
+title.TextSize = 15
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = header
+
+local function headerButton(text, xOffset)
+    local b = Instance.new("TextButton")
+    b.Size = UDim2.fromOffset(24, 22)
+    b.Position = UDim2.new(1, xOffset, 0, 4)
+    b.BackgroundColor3 = THEME.off
+    b.Text = text
+    b.TextColor3 = THEME.green
+    b.Font = Enum.Font.GothamBold
+    b.TextSize = 14
+    b.BorderSizePixel = 0
+    b.Parent = header
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    return b
+end
+
+local minBtn = headerButton("-", -56)
+local closeBtn = headerButton("X", -28)
+
+-- ===== Tabs =====
+local tabBar = Instance.new("Frame")
+tabBar.Size = UDim2.new(1, -16, 0, 26)
+tabBar.Position = UDim2.fromOffset(8, 36)
+tabBar.BackgroundTransparency = 1
+tabBar.Parent = main
+local tabLayout = Instance.new("UIListLayout", tabBar)
+tabLayout.FillDirection = Enum.FillDirection.Horizontal
+tabLayout.Padding = UDim.new(0, 4)
+
+local pagesHolder = Instance.new("Frame")
+pagesHolder.Size = UDim2.new(1, -16, 1, -98)
+pagesHolder.Position = UDim2.fromOffset(8, 68)
+pagesHolder.BackgroundTransparency = 1
+pagesHolder.ClipsDescendants = true
+pagesHolder.Parent = main
+
+local pages, tabButtons = {}, {}
+
+local function selectTab(name)
+    for n, page in pairs(pages) do
+        page.Visible = (n == name)
+    end
+    for n, b in pairs(tabButtons) do
+        local active = (n == name)
+        b.BackgroundColor3 = active and THEME.green or THEME.off
+        b.TextColor3 = active and THEME.black or THEME.green
+    end
+end
+
+local function newPage(name)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1 / 3, -3, 1, 0)
+    btn.BorderSizePixel = 0
+    btn.Text = name
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 12
+    btn.Parent = tabBar
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+    local page = Instance.new("ScrollingFrame")
+    page.Size = UDim2.new(1, 0, 1, 0)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 3
+    page.ScrollBarImageColor3 = THEME.green
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.Visible = false
+
+    local list = Instance.new("UIListLayout", page)
+    list.Padding = UDim.new(0, 6)
+    list.SortOrder = Enum.SortOrder.LayoutOrder
+    local pad = Instance.new("UIPadding", page)
+    pad.PaddingRight = UDim.new(0, 6)
+    page.Parent = pagesHolder
+
+    pages[name] = page
+    tabButtons[name] = btn
+    btn.MouseButton1Click:Connect(function() selectTab(name) end)
+    return page
+end
+
+-- ===== Dragging (mouse + touch) =====
+-- The move listener only exists WHILE dragging (no per-mouse-move cost otherwise).
+local moveConn
+header.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+        and input.UserInputType ~= Enum.UserInputType.Touch then
+        return
+    end
+
+    local dragStart = input.Position
+    local startPos = main.Position
+    local startInput = input
+
+    if moveConn then moveConn:Disconnect() end
+    moveConn = UIS.InputChanged:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseMovement
+            or (i.UserInputType == Enum.UserInputType.Touch and i == startInput) then
+            local d = i.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
+        end
+    end)
+
+    local endConn
+    endConn = input.Changed:Connect(function()
+        if input.UserInputState == Enum.UserInputState.End then
+            if moveConn then moveConn:Disconnect() moveConn = nil end
+            endConn:Disconnect()
+        end
+    end)
+end)
+
+-- ===== UI helpers =====
+local order = 0
+local function nextOrder() order += 1 return order end
+
+local function makeToggle(page, text, default, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 30)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 13
+    btn.LayoutOrder = nextOrder()
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+    local state = default
+    local function refresh()
+        btn.Text = text .. ": " .. (state and "ON" or "OFF")
+        btn.BackgroundColor3 = state and THEME.green or THEME.off
+        btn.TextColor3 = state and THEME.black or THEME.green
+    end
+    refresh()
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        refresh()
+        callback(state)
+    end)
+    btn.Parent = page
+    return btn
+end
+
+local function makeButton(page, text, callback)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 0, 30)
+    btn.BackgroundColor3 = THEME.greenDark
+    btn.BorderSizePixel = 0
+    btn.Text = text
+    btn.TextColor3 = THEME.text
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 13
+    btn.LayoutOrder = nextOrder()
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    btn.MouseButton1Click:Connect(function() callback(btn) end)
+    btn.Parent = page
+    return btn
+end
+
+local function makeBox(page, labelText, default, callback)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 0, 28)
+    row.BackgroundTransparency = 1
+    row.LayoutOrder = nextOrder()
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(0.5, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = labelText
+    lbl.TextColor3 = THEME.text
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 12
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.Parent = row
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(0.5, 0, 1, 0)
+    box.Position = UDim2.new(0.5, 0, 0, 0)
+    box.BackgroundColor3 = THEME.box
+    box.BorderSizePixel = 0
+    box.Text = tostring(default)
+    box.TextColor3 = THEME.green
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 12
+    box.ClearTextOnFocus = false
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+    box.Parent = row
+
+    box.FocusLost:Connect(function()
+        callback(box.Text, box)
+    end)
+    row.Parent = page
+    return box
+end
+
+-- Number box bound to a Config key
+local function numBox(page, label, key, min)
+    return makeBox(page, label, Config[key], function(text, box)
+        local n = tonumber(text)
+        if n and n == n and n >= min and math.abs(n) < 1e9 then
+            Config[key] = n
+        end
+        box.Text = tostring(Config[key])
+    end)
+end
+
+local function fmtVec(v) return string.format("%g, %g, %g", v.X, v.Y, v.Z) end
+
+local function parseVec(text)
+    local nums = {}
+    for s in string.gmatch(text, "[%-%d%.]+") do
+        local n = tonumber(s)
+        if n and n == n and math.abs(n) < 1e6 then
+            nums[#nums + 1] = n
+        end
+    end
+    if #nums == 3 then
+        return Vector3.new(nums[1], nums[2], nums[3])
+    end
+    return nil
+end
+
+local status = Instance.new("TextLabel")
+status.Size = UDim2.new(1, -16, 0, 20)
+status.Position = UDim2.new(0, 8, 1, -24)
+status.BackgroundTransparency = 1
+status.Text = "Status: Idle"
+status.TextColor3 = THEME.green
+status.Font = Enum.Font.Gotham
+status.TextSize = 12
+status.TextXAlignment = Enum.TextXAlignment.Left
+status.TextTruncate = Enum.TextTruncate.AtEnd
+status.Parent = main
+
+local lastStatus = ""
+local function setStatus(t)
+    if t ~= lastStatus and status.Parent then
+        lastStatus = t
+        status.Text = "Status: " .. t
+    end
+end
+
+-- ===== Core logic =====
+local remoteCache = {}
+-- deep = also search all of ReplicatedStorage (only used for the Training_Bonus event)
+local function getRemote(name, deep)
+    local r = remoteCache[name]
+    if r and r.Parent then return r end
+    local remotes = RS:FindFirstChild("Remotes")
+    r = remotes and remotes:FindFirstChild(name)
+    if not r and deep then
+        r = RS:FindFirstChild(name, true)
+    end
+    remoteCache[name] = r
+    return r
+end
+
+-- Cached character parts (only re-searched when the character changes)
+local hrpCache, humCache
+local function getHRP()
+    local char = player.Character
+    if not char then return nil end
+    if not (hrpCache and hrpCache.Parent == char) then
+        hrpCache = char:FindFirstChild("HumanoidRootPart")
+        humCache = char:FindFirstChildOfClass("Humanoid")
+    end
+    if hrpCache and humCache and humCache.Health > 0 then
+        return hrpCache
+    end
+    return nil
+end
+
+local function teleport(target, force)
+    local hrp = getHRP()
+    if not hrp then return false end
+    if force or (hrp.Position - target).Magnitude > 2 then
+        hrp.CFrame = CFrame.new(target)
+    end
+    return true
+end
+
+-- Smooth tween to a position (duration = distance / TweenSpeed).
+-- Yields until the tween finishes or is cancelled, so call it from a task.
+local activeTween
+local function cancelTween()
+    if activeTween then
+        activeTween:Cancel()
+        activeTween = nil
+    end
+end
+
+local function tweenTo(target)
+    local hrp = getHRP()
+    if not hrp then return false end
+    cancelTween()
+
+    local dist = (hrp.Position - target).Magnitude
+    if dist < 0.5 then return true end
+
+    local duration = math.max(dist / math.max(Config.TweenSpeed, 1), 0.05)
+    local goal = CFrame.new(target) * hrp.CFrame.Rotation -- keep facing direction
+    local tw = TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear), { CFrame = goal })
+    activeTween = tw
+    tw:Play()
+    tw.Completed:Wait()
+    if activeTween == tw then activeTween = nil end
+    return true
+end
+
+-- ===== Farm loop =====
+local loopId = 0
+local function startLoop()
+    loopId += 1
+    local myId = loopId
+    local lastBeat = os.clock()
+
+    local function running()
+        return gui.Parent ~= nil and Config.Enabled and myId == loopId
+    end
+
+    -- Main loop: direct pcall'd remote calls (no extra threads/timers per call)
+    task.spawn(function()
+        local cycles, fails, runs = 0, 0, 0
+
+        while running() do
+            lastBeat = os.clock()
+
+            local startR = getRemote("Throw_Start")
+            local resolveR = getRemote("Throw_Resolve")
+            local completeR = getRemote("Throw_Complete")
+
+            if not (startR and resolveR and completeR) then
+                setStatus("Remotes not found")
+                task.wait(1)
+                continue
+            end
+
+            if not getHRP() then
+                setStatus("Waiting for character")
+                task.wait(0.25)
+                continue
+            end
+
+            if Config.Teleport and (Config.TeleportEveryCycle or runs == 0) then
+                teleport(Config.Position)
+            end
+
+            runs += 1
+
+            local ok1 = pcall(startR.InvokeServer, startR)
+            if not running() then break end
+
+            lastBeat = os.clock()
+            task.wait(Config.ThrowDelay)
+            if not running() then break end
+
+            lastBeat = os.clock()
+            local ok2 = pcall(resolveR.InvokeServer, resolveR, Config.ResolveValue)
+            if not running() then break end
+
+            local ok3 = pcall(completeR.InvokeServer, completeR)
+
+            -- Equip best pets every N cycles, in the background (doesn't slow the loop)
+            if Config.EquipBest and runs % Config.EquipEvery == 0 then
+                local equipR = getRemote("Plot_EquipBest")
+                if equipR then
+                    task.spawn(pcall, equipR.InvokeServer, equipR)
+                end
+            end
+
+            if ok1 and ok2 and ok3 then
+                fails = 0
+                cycles += 1
+                if cycles % 10 == 1 then -- throttle label updates
+                    setStatus("Farming (" .. cycles .. " cycles)")
+                end
+            else
+                fails += 1
+                if fails >= 5 then
+                    setStatus("Errors - check remotes/position")
+                    task.wait(1)
+                end
+            end
+
+            task.wait(Config.CycleDelay)
+        end
+
+        if myId == loopId then setStatus("Idle") end
+    end)
+
+    -- Watchdog: if the server never answers, restart the loop (one cheap thread)
+    task.spawn(function()
+        while running() do
+            task.wait(2)
+            if running() and os.clock() - lastBeat > Config.ThrowDelay + Config.CycleDelay + 8 then
+                setStatus("Stuck - restarting")
+                startLoop()
+                return
+            end
+        end
+    end)
+end
+
+local function stopLoop()
+    Config.Enabled = false
+    loopId += 1
+end
+
+-- ===== Auto 2x bonus =====
+-- The server fires Training_Bonus(id, timestamp) when the x2 button spawns.
+-- We answer with Training_TapBonus(id). The id comes from the server, so it
+-- restarts by itself every training session (nothing to reset).
+local bonusConn
+local fallbackId = 0 -- only used if the server ever sends a non-number id
+
+local function stopBonus()
+    if bonusConn then
+        bonusConn:Disconnect()
+        bonusConn = nil
+    end
+end
+
+local function startBonus()
+    if bonusConn then return end
+    local ev = getRemote("Training_Bonus", true)
+    if not ev then
+        setStatus("Training_Bonus event not found")
+        return
+    end
+
+    bonusConn = ev.OnClientEvent:Connect(function(id)
+        local tapId = id
+        if type(tapId) ~= "number" then
+            fallbackId += 1
+            tapId = fallbackId
+        end
+
+        task.spawn(function()
+            if Config.BonusDelay > 0 then task.wait(Config.BonusDelay) end
+            if not (Config.Training and Config.AutoBonus) then return end
+
+            local r = getRemote("Training_TapBonus")
+            if not r then
+                setStatus("TapBonus remote not found")
+                return
+            end
+            local ok, res = pcall(r.InvokeServer, r, tapId)
+            setStatus("Bonus #" .. tostring(tapId) .. (ok and (" -> " .. tostring(res)) or " failed"))
+        end)
+    end)
+end
+
+local function refreshBonus()
+    if Config.Training and Config.AutoBonus then
+        startBonus()
+    else
+        stopBonus()
+    end
+end
+
+-- ===== Auto train =====
+-- ON: tween to the train position (no Training_Start). OFF: cancel tween + Training_Stop.
+local function setTraining(on)
+    Config.Training = on
+    fallbackId = 0 -- fresh count for every session
+    refreshBonus()
+    if on then
+        task.spawn(tweenTo, Config.TrainPosition)
+    else
+        cancelTween()
+        task.spawn(function()
+            local r = getRemote("Training_Stop")
+            if r then pcall(r.InvokeServer, r) end
+        end)
+    end
+end
+
+-- ===== Anti-AFK =====
+local afkConn
+local function setAntiAfk(on)
+    Config.AntiAfk = on
+    if afkConn then
+        afkConn:Disconnect()
+        afkConn = nil
+    end
+    if on then
+        afkConn = player.Idled:Connect(function()
+            pcall(function()
+                VirtualUser:CaptureController()
+                VirtualUser:ClickButton2(Vector2.new(0, 0))
+            end)
+        end)
+    end
+end
+
+-- ===== Copy current position =====
+local function copyPosition(btn)
+    local hrp = getHRP()
+    local original = "Copy current position"
+    if not hrp then
+        btn.Text = "No character"
+    else
+        local p = hrp.Position
+        local str = string.format("%.1f, %.1f, %.1f", p.X, p.Y, p.Z)
+        local clip = setclipboard or toclipboard or (syn and syn.write_clipboard)
+        local ok = false
+        if clip then ok = pcall(clip, str) end
+        btn.Text = (ok and "Copied: " or "No clipboard: ") .. str
+    end
+    task.delay(2, function()
+        if btn.Parent then btn.Text = original end
+    end)
+end
+
+-- ===== Pages =====
+local farmPage = newPage("Autofarm")
+local trainPage = newPage("Auto Train")
+local configPage = newPage("Config")
+
+-- Autofarm tab
+makeToggle(farmPage, "Autofarm", false, function(v)
+    Config.Enabled = v
+    if v then startLoop() else stopLoop() setStatus("Idle") end
+end)
+makeToggle(farmPage, "Teleport", Config.Teleport, function(v) Config.Teleport = v end)
+makeToggle(farmPage, "Teleport every cycle", Config.TeleportEveryCycle, function(v)
+    Config.TeleportEveryCycle = v
+end)
+makeToggle(farmPage, "Equip best pets", Config.EquipBest, function(v)
+    Config.EquipBest = v
+end)
+makeButton(farmPage, "Teleport to farm pos", function()
+    teleport(Config.Position, true)
+end)
+
+-- Auto Train tab
+makeToggle(trainPage, "Auto train", false, function(v)
+    setTraining(v)
+end)
+makeToggle(trainPage, "Auto 2x bonus", Config.AutoBonus, function(v)
+    Config.AutoBonus = v
+    refreshBonus()
+end)
+numBox(trainPage, "Bonus delay (s)", "BonusDelay", 0)
+makeBox(trainPage, "Train pos (x,y,z)", fmtVec(Config.TrainPosition), function(text, box)
+    local v = parseVec(text)
+    if v then Config.TrainPosition = v end
+    box.Text = fmtVec(Config.TrainPosition)
+end)
+numBox(trainPage, "Tween speed", "TweenSpeed", 1)
+makeButton(trainPage, "Tween to train pos", function()
+    task.spawn(tweenTo, Config.TrainPosition)
+end)
+
+-- Config tab
+makeBox(configPage, "Farm pos (x,y,z)", fmtVec(Config.Position), function(text, box)
+    local v = parseVec(text)
+    if v then Config.Position = v end
+    box.Text = fmtVec(Config.Position)
+end)
+
+-- Whole number >= 1
+makeBox(configPage, "Equip every N cycles", Config.EquipEvery, function(text, box)
+    local n = tonumber(text)
+    if n and n == n and n >= 1 and n < 1e6 then
+        Config.EquipEvery = math.floor(n)
+    end
+    box.Text = tostring(Config.EquipEvery)
+end)
+
+numBox(configPage, "Throw delay (s)", "ThrowDelay", 0)
+numBox(configPage, "Cycle delay (s)", "CycleDelay", 0.03)
+numBox(configPage, "Resolve value", "ResolveValue", -1e9)
+
+makeToggle(configPage, "Anti-AFK", Config.AntiAfk, function(v)
+    setAntiAfk(v)
+end)
+makeButton(configPage, "Copy current position", copyPosition)
+
+setAntiAfk(Config.AntiAfk)
+selectTab("Autofarm")
+gui.Parent = parent -- parent last: the whole GUI is built before it renders
+
+-- ===== Minimize / Close =====
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    tabBar.Visible = not minimized
+    pagesHolder.Visible = not minimized
+    status.Visible = not minimized
+    main.Size = minimized and UDim2.fromOffset(260, 30) or FULL_SIZE
+    minBtn.Text = minimized and "+" or "-"
+end)
+
+gui.Destroying:Connect(function()
+    stopLoop()
+    stopBonus()
+    cancelTween()
+    if moveConn then moveConn:Disconnect() moveConn = nil end
+    if afkConn then afkConn:Disconnect() afkConn = nil end
+    -- Stop training if it's still on when the GUI closes
+    if Config.Training then
+        Config.Training = false
+        local r = getRemote("Training_Stop")
+        if r then
+            task.spawn(pcall, r.InvokeServer, r)
+        end
+    end
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+    gui:Destroy()
+end)
